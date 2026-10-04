@@ -101,20 +101,23 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**闸门补齐池系归属 `seriesName`** —— 升级时按上下游池反推补上（优先上游池池系，其次下游池），
+    反推不出来的留空（没主的闸门在 `/gates` 只读，不可编辑/删除）；
+    同时为走水编排补齐 **`targetPondId`（目标池）与 `blockedReason`（断开/排队原因）**。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `ponds` | id | code, seriesName, stage, status, createdAt, updatedAt |
-  | `gates` | id | fromPondId, toPondId, state, openingPct |
+  | `gates` | id | fromPondId, toPondId, seriesName, state, openingPct |
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
-  | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `schedules` | id | pondId, targetPondId, planDate, state, orderIndex |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -157,3 +160,10 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+* **串级连通性核查**（`checkConnectivity`）：调度室放行（待排→已排）时，按管护班当下走向核查上游池到目标池通不通。
+  只认「状态非关闭且开度 > 0」的闸门；开度小幅调整（仍 > 0）不打回计划，关门或改派下游池才断。
+  不通则退回待排（`blockedReason` 写明断在哪道闸门 / 改派 / 无通路）。管护班关掉通路或改派下游池时，
+  靠它排的计划也退回去等重排（已出卤的留着）。闸门串级归管护班、走水计划归调度室，两边各自记账，谁也改不了对方。
+* **下游池容量核查**（`checkCapacity`）：放行时查下游池剩余容量（有效体积 − 当前卤水体积，按最近观测水位估算），
+  不够纳计划量则先排队（退回待排），`blockedReason` 写清差量。
+* **保存失败重试**（`withRetry`）：哪侧保存失败就重试本侧，不把一侧失败扩散到另一侧；IndexedDB 写入偶发失败时自动重试若干次。

@@ -7,6 +7,7 @@
  */
 import type { Assay, AssayVerdict } from '../types/assay';
 import type { Gate } from '../types/gate';
+import type { Pond } from '../types/pond';
 
 /** 保留 1 位小数 */
 export function round1(value: number): number {
@@ -132,4 +133,164 @@ export function effectiveVerdict(assay: Pick<Assay, 'verdict' | 'verdictManual' 
 /** 密度是否达到目标（用于判断走水是否可以出卤） */
 export function densityReached(currentDensity: number, targetDensity: number): boolean {
   return currentDensity >= targetDensity;
+}
+
+/* ------------------------- 闸门串级连通性核查 ------------------------- */
+
+/** 闸门是否可过水：状态非关闭且开度 > 0。小幅调开度（仍 > 0）不算断开，关门才算。 */
+export function gateIsPassable(gate: Pick<Gate, 'state' | 'openingPct'>): boolean {
+  return gate.state !== '关闭' && gate.openingPct > 0;
+}
+
+export interface ConnectivityResult {
+  /** 上游池到目标池是否连通 */
+  connected: boolean;
+  /** 断开的闸门 id（能定位时给出） */
+  brokenGateId: string | null;
+  /** 断开原因说明（写明断在哪道闸门 / 改派 / 无通路） */
+  reason: string;
+}
+
+/**
+ * 核查上游池到目标池在当前闸门串级下是否连通。
+ * 管护班当下走向为准：只认「状态非关闭且开度 > 0」的闸门；
+ * 开度小幅调整（仍 > 0）不影响连通判定，关门或改派下游池才会断。
+ */
+export function checkConnectivity(
+  sourceId: string,
+  targetId: string,
+  gates: Gate[],
+  ponds: Pond[],
+): ConnectivityResult {
+  if (sourceId === targetId) {
+    return { connected: true, brokenGateId: null, reason: '' };
+  }
+
+  const pondIds = new Set(ponds.map((pond) => pond.id));
+  if (!pondIds.has(sourceId) || !pondIds.has(targetId)) {
+    return { connected: false, brokenGateId: null, reason: '上游池或目标池已不存在，无法核查串级通路' };
+  }
+
+  const passable = gates.filter((gate) => gateIsPassable(gate));
+  const passableAdj = new Map<string, string[]>();
+  passable.forEach((gate) => {
+    const list = passableAdj.get(gate.fromPondId) ?? [];
+    list.push(gate.toPondId);
+    passableAdj.set(gate.fromPondId, list);
+  });
+
+  // BFS 用可过水闸门找通路
+  const reachable = new Set<string>([sourceId]);
+  const queue: string[] = [sourceId];
+  while (queue.length > 0) {
+    const cur = queue.shift() as string;
+    if (cur === targetId) {
+      return { connected: true, brokenGateId: null, reason: '' };
+    }
+    (passableAdj.get(cur) ?? []).forEach((next) => {
+      if (!reachable.has(next)) {
+        reachable.add(next);
+        queue.push(next);
+      }
+    });
+  }
+
+  // 不通：按名义走向（全部闸门，不分开关）定位断开的那道闸门
+  const nominalAdj = new Map<string, Array<{ to: string; gate: Gate }>>();
+  gates.forEach((gate) => {
+    const list = nominalAdj.get(gate.fromPondId) ?? [];
+    list.push({ to: gate.toPondId, gate });
+    nominalAdj.set(gate.fromPondId, list);
+  });
+
+  const prev = new Map<string, { from: string; gate: Gate }>();
+  const nQueue: string[] = [sourceId];
+  const nVisited = new Set<string>([sourceId]);
+  let found = false;
+  while (nQueue.length > 0 && !found) {
+    const cur = nQueue.shift() as string;
+    for (const edge of nominalAdj.get(cur) ?? []) {
+      if (nVisited.has(edge.to)) continue;
+      nVisited.add(edge.to);
+      prev.set(edge.to, { from: cur, gate: edge.gate });
+      if (edge.to === targetId) {
+        found = true;
+        break;
+      }
+      nQueue.push(edge.to);
+    }
+  }
+
+  if (!found) {
+    // 名义走向都到不了目标池：多半是闸门改派下游池，旧通路已作废
+    return {
+      connected: false,
+      brokenGateId: null,
+      reason: '上游池到目标池之间已无闸门通路（闸门可能已改派下游池，旧通路作废）',
+    };
+  }
+
+  // 沿名义路径回查第一道不可过水的闸门
+  const path: Gate[] = [];
+  let cur = targetId;
+  while (cur !== sourceId) {
+    const step = prev.get(cur);
+    if (step === undefined) break;
+    path.unshift(step.gate);
+    cur = step.from;
+  }
+  const broken = path.find((gate) => !gateIsPassable(gate));
+  if (broken !== undefined) {
+    const label = gateLabel(broken, ponds);
+    if (broken.state === '关闭' || broken.openingPct <= 0) {
+      return {
+        connected: false,
+        brokenGateId: broken.id,
+        reason: `闸门 ${label} 已关闭（开度 ${broken.openingPct}%），上游池到目标池的通路断开`,
+      };
+    }
+    return {
+      connected: false,
+      brokenGateId: broken.id,
+      reason: `闸门 ${label} 不可过水（状态 ${broken.state} / 开度 ${broken.openingPct}%），通路断开`,
+    };
+  }
+
+  return { connected: false, brokenGateId: null, reason: '上游池到目标池的串级通路不通' };
+}
+
+/** 闸门标签：上游池 → 下游池（池已删除时兜底） */
+export function gateLabel(gate: Pick<Gate, 'fromPondId' | 'toPondId'>, ponds: Pond[]): string {
+  const labelOf = (pondId: string): string => {
+    const pond = ponds.find((item) => item.id === pondId);
+    return pond === undefined ? '（池已删除）' : pond.code;
+  };
+  return `${labelOf(gate.fromPondId)} → ${labelOf(gate.toPondId)}`;
+}
+
+/* ------------------------- 下游池容量核查 ------------------------- */
+
+export interface CapacityResult {
+  /** 下游池剩余可纳容量（m³） */
+  remainingM3: number;
+  /** 是否够纳计划量 */
+  sufficient: boolean;
+  /** 差量（m³）：计划量 - 剩余容量，不够时为正 */
+  deficitM3: number;
+}
+
+/**
+ * 核查下游池容量是否够纳计划走水量。
+ * 剩余容量 = 有效体积 - 当前卤水体积（按最近观测水位估算）。
+ */
+export function checkCapacity(
+  target: Pond,
+  volumeM3: number,
+  latestLevelCm: number,
+): CapacityResult {
+  const effective = pondVolumeM3(target.areaM2, target.depthCm);
+  const current = Math.round(target.areaM2 * (latestLevelCm / 100) * 10) / 10;
+  const remaining = Math.max(0, Math.round((effective - current) * 10) / 10);
+  const deficit = Math.round((volumeM3 - remaining) * 10) / 10;
+  return { remainingM3: remaining, sufficient: deficit <= 0, deficitM3: Math.max(0, deficit) };
 }

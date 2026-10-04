@@ -71,8 +71,8 @@ export default function App(props: RouteSectionProps) {
 
           <div class="mt-4 hidden rounded-lg border border-slate-200 bg-white p-3 text-xs leading-relaxed text-slate-500 lg:block">
             <p class="mb-1 font-semibold text-slate-700">数据存储</p>
-            <p>库名 gbbrinepond（IndexedDB / Dexie），结构版本 v2。</p>
-            <p class="mt-1">v1 建表与 pondId+date 复合索引；v2 新增 evapMm 并迁移旧记录。</p>
+            <p>库名 gbbrinepond（IndexedDB / Dexie），结构版本 v3。</p>
+            <p class="mt-1">v1 建表与 pondId+date 复合索引；v2 新增 evapMm 并迁移旧记录；v3 闸门补池系归属、走水补目标池与断开原因。</p>
           </div>
         </nav>
 

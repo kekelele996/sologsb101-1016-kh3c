@@ -3,6 +3,8 @@
  * - 数据库名：gbbrinepond
  * - v1：建立全部表与 pondId+date 复合索引
  * - v2：新增 evapMm 字段并写入升级迁移逻辑，旧记录自动补齐默认值
+ * - v3：闸门补齐池系归属 seriesName（按上下游池反推，没主的留空只读）；
+ *        走水编排补齐目标池 targetPondId 与断开原因 blockedReason
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie';
@@ -19,10 +21,10 @@ import { seedDatabase } from './seed';
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -44,7 +46,7 @@ class BrinePondDatabase extends Dexie {
     });
 
     // ---------- v2：新增 evapMm 字段，并为旧记录补齐默认值 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
         gates: 'id, fromPondId, toPondId, state, openingPct',
@@ -90,10 +92,64 @@ class BrinePondDatabase extends Dexie {
           }
         });
       });
+
+    // ---------- v3：闸门补齐池系归属 seriesName（按上下游池反推，没主的留空只读） ----------
+    this.version(3)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, seriesName, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, targetPondId, planDate, state, orderIndex',
+      })
+      .upgrade(async (tx) => {
+        const pondRows = await tx.table('ponds').toArray();
+        const pondSeries = new Map<string, string>();
+        (pondRows as Pond[]).forEach((pond) => {
+          if (typeof pond.seriesName === 'string' && pond.seriesName.trim() !== '') {
+            pondSeries.set(pond.id, pond.seriesName);
+          }
+        });
+        await tx.table('gates').toCollection().modify((row: Record<string, unknown>) => {
+          // 已有池系归属的不覆盖
+          if (typeof row.seriesName === 'string' && row.seriesName.trim() !== '') return;
+          const fromId = typeof row.fromPondId === 'string' ? row.fromPondId : '';
+          const toId = typeof row.toPondId === 'string' ? row.toPondId : '';
+          // 按上下游池反推：优先上游池的池系，其次下游池
+          const inferred = pondSeries.get(fromId) ?? pondSeries.get(toId) ?? '';
+          row.seriesName = inferred;
+        });
+        // 走水编排补齐目标池与断开原因字段
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (typeof row.targetPondId !== 'string') row.targetPondId = '';
+          if (typeof row.blockedReason !== 'string') row.blockedReason = '';
+        });
+      });
   }
 }
 
 export const db = new BrinePondDatabase();
+
+/* ------------------------------ 保存失败重试 ------------------------------ */
+
+/**
+ * 保存失败重试：哪侧保存失败就重试本侧，不把一侧的失败扩散到另一侧。
+ * 纯前端 IndexedDB 写入偶发失败（如事务冲突、配额抖动）时，自动重试若干次。
+ */
+export async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 150): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('保存失败');
+}
 
 /* ------------------------------ 初始化与播种 ------------------------------ */
 
@@ -124,20 +180,22 @@ export async function listPonds(): Promise<Pond[]> {
 }
 
 export async function putPond(row: Pond): Promise<void> {
-  await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await withRetry(() => db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION }));
 }
 
 /** 删除蒸发池，并级联清理相关闸门、观测、化验与走水计划 */
 export async function removePond(id: string): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    const gates = await db.gates.toArray();
-    const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
-    if (related.length > 0) await db.gates.bulkDelete(related);
-    await db.observations.where('pondId').equals(id).delete();
-    await db.assays.where('pondId').equals(id).delete();
-    await db.schedules.where('pondId').equals(id).delete();
-    await db.ponds.delete(id);
-  });
+  await withRetry(() =>
+    db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+      const gates = await db.gates.toArray();
+      const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
+      if (related.length > 0) await db.gates.bulkDelete(related);
+      await db.observations.where('pondId').equals(id).delete();
+      await db.assays.where('pondId').equals(id).delete();
+      await db.schedules.where('pondId').equals(id).delete();
+      await db.ponds.delete(id);
+    }),
+  );
 }
 
 /* -------------------------------- 闸门 -------------------------------- */
@@ -147,16 +205,16 @@ export async function listGates(): Promise<Gate[]> {
 }
 
 export async function putGate(row: Gate): Promise<void> {
-  await db.gates.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await withRetry(() => db.gates.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION }));
 }
 
 /** 就地调整开度：同步推导闸门状态 */
 export async function updateGateOpening(id: string, openingPct: number, state: Gate['state']): Promise<void> {
-  await db.gates.update(id, { openingPct, state, updatedAt: nowIso() });
+  await withRetry(() => db.gates.update(id, { openingPct, state, updatedAt: nowIso() }));
 }
 
 export async function removeGate(id: string): Promise<void> {
-  await db.gates.delete(id);
+  await withRetry(() => db.gates.delete(id));
 }
 
 /* ------------------------------ 卤水日观测 ------------------------------ */
@@ -189,7 +247,7 @@ export async function upsertObservation(row: Observation): Promise<Observation> 
     updatedAt: nowIso(),
     revision: ROW_REVISION,
   };
-  await db.observations.put(next);
+  await withRetry(() => db.observations.put(next));
   return next;
 }
 
@@ -210,7 +268,7 @@ export async function listAssaysByPond(pondId: string): Promise<Assay[]> {
 }
 
 export async function putAssay(row: Assay): Promise<void> {
-  await db.assays.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await withRetry(() => db.assays.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION }));
 }
 
 export async function removeAssay(id: string): Promise<void> {
@@ -225,44 +283,48 @@ export async function listSchedules(): Promise<Schedule[]> {
 }
 
 export async function putSchedule(row: Schedule): Promise<void> {
-  await db.schedules.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await withRetry(() => db.schedules.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION }));
 }
 
 export async function removeSchedule(id: string): Promise<void> {
-  await db.schedules.delete(id);
+  await withRetry(() => db.schedules.delete(id));
 }
 
 /** 按给定 id 顺序重写排序序号（拖拽排序后调用） */
 export async function reorderSchedules(orderedIds: string[]): Promise<void> {
-  await db.transaction('rw', db.schedules, async () => {
-    for (let index = 0; index < orderedIds.length; index += 1) {
-      await db.schedules.update(orderedIds[index], { orderIndex: index + 1, updatedAt: nowIso() });
-    }
-  });
+  await withRetry(() =>
+    db.transaction('rw', db.schedules, async () => {
+      for (let index = 0; index < orderedIds.length; index += 1) {
+        await db.schedules.update(orderedIds[index], { orderIndex: index + 1, updatedAt: nowIso() });
+      }
+    }),
+  );
 }
 
 /**
  * 出卤完成回写：把蒸发池推进到下一阶段，并把最新一次观测的密度对齐到实际密度。
  */
 export async function applyDischarge(scheduleId: string, actualDensity: number): Promise<void> {
-  await db.transaction('rw', db.ponds, db.schedules, db.observations, async () => {
-    const schedule = await db.schedules.get(scheduleId);
-    if (!schedule) return;
-    await db.schedules.update(scheduleId, { state: '已出卤', updatedAt: nowIso() });
-    const pond = await db.ponds.get(schedule.pondId);
-    if (!pond) return;
-    const nextStage: Pond['stage'] = pond.stage === '钠盐' ? '钾盐' : pond.stage === '钾盐' ? '锂盐' : '锂盐';
-    await db.ponds.update(pond.id, { stage: nextStage, updatedAt: nowIso() });
-    const list = await db.observations.where('pondId').equals(pond.id).toArray();
-    if (list.length === 0) return;
-    const latest = list.reduce((acc, item) => (item.date > acc.date ? item : acc));
-    const density = actualDensity > 0 ? actualDensity : latest.densityGcm3;
-    await db.observations.update(latest.id, {
-      densityGcm3: density,
-      evapMm: estimateEvapMm(density, latest.tempC, latest.levelCm, latest.windLevel),
-      updatedAt: nowIso(),
-    });
-  });
+  await withRetry(() =>
+    db.transaction('rw', db.ponds, db.schedules, db.observations, async () => {
+      const schedule = await db.schedules.get(scheduleId);
+      if (!schedule) return;
+      await db.schedules.update(scheduleId, { state: '已出卤', updatedAt: nowIso() });
+      const pond = await db.ponds.get(schedule.pondId);
+      if (!pond) return;
+      const nextStage: Pond['stage'] = pond.stage === '钠盐' ? '钾盐' : pond.stage === '钾盐' ? '锂盐' : '锂盐';
+      await db.ponds.update(pond.id, { stage: nextStage, updatedAt: nowIso() });
+      const list = await db.observations.where('pondId').equals(pond.id).toArray();
+      if (list.length === 0) return;
+      const latest = list.reduce((acc, item) => (item.date > acc.date ? item : acc));
+      const density = actualDensity > 0 ? actualDensity : latest.densityGcm3;
+      await db.observations.update(latest.id, {
+        densityGcm3: density,
+        evapMm: estimateEvapMm(density, latest.tempC, latest.levelCm, latest.windLevel),
+        updatedAt: nowIso(),
+      });
+    }),
+  );
 }
 
 /** 推进走水状态 */
@@ -299,32 +361,49 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await Promise.all([
-      db.ponds.clear(),
-      db.gates.clear(),
-      db.observations.clear(),
-      db.assays.clear(),
-      db.schedules.clear(),
-    ]);
-    await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
-  });
+  await withRetry(() =>
+    db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+      await Promise.all([
+        db.ponds.clear(),
+        db.gates.clear(),
+        db.observations.clear(),
+        db.assays.clear(),
+        db.schedules.clear(),
+      ]);
+      await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.gates.bulkPut(
+        snapshot.gates.map((row) => ({
+          ...row,
+          seriesName: typeof row.seriesName === 'string' ? row.seriesName : '',
+          revision: ROW_REVISION,
+        })),
+      );
+      await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
+      await db.schedules.bulkPut(
+        snapshot.schedules.map((row) => ({
+          ...row,
+          targetPondId: typeof row.targetPondId === 'string' ? row.targetPondId : '',
+          blockedReason: typeof row.blockedReason === 'string' ? row.blockedReason : '',
+          revision: ROW_REVISION,
+        })),
+      );
+    }),
+  );
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await Promise.all([
-      db.ponds.clear(),
-      db.gates.clear(),
-      db.observations.clear(),
-      db.assays.clear(),
-      db.schedules.clear(),
-    ]);
-  });
+  await withRetry(() =>
+    db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+      await Promise.all([
+        db.ponds.clear(),
+        db.gates.clear(),
+        db.observations.clear(),
+        db.assays.clear(),
+        db.schedules.clear(),
+      ]);
+    }),
+  );
   await seedDatabase();
 }
 

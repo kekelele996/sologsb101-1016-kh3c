@@ -34,6 +34,7 @@ const STATE_STYLE: Record<ScheduleState, string> = {
 function emptyDraft(pondId: string, orderIndex: number): ScheduleDraft {
   return {
     pondId,
+    targetPondId: '',
     planDate: today(),
     targetDensity: 1.15,
     volumeM3: 800,
@@ -98,8 +99,10 @@ export default function ScheduleBoard() {
 
   const openCreate = (): void => {
     const pondId = pondStore.pondsOfSeries(pondStore.state.currentSeries)[0]?.id ?? pondStore.state.ponds[0]?.id ?? '';
+    const defaultTarget = pondStore.state.ponds.find((pond) => pond.id !== pondId)?.id ?? '';
     setEditingId(null);
     setDraft(emptyDraft(pondId, ordered().length + 1));
+    setDraft('targetPondId', defaultTarget);
     setDialogOpen(true);
   };
 
@@ -107,6 +110,7 @@ export default function ScheduleBoard() {
     setEditingId(row.id);
     setDraft({
       pondId: row.pondId,
+      targetPondId: row.targetPondId,
       planDate: row.planDate,
       targetDensity: row.targetDensity,
       volumeM3: row.volumeM3,
@@ -119,7 +123,15 @@ export default function ScheduleBoard() {
 
   const submit = async (): Promise<void> => {
     if (draft.pondId === '') {
-      scheduleStore.setMessage('请选择蒸发池');
+      scheduleStore.setMessage('请选择上游池');
+      return;
+    }
+    if (draft.targetPondId === '') {
+      scheduleStore.setMessage('请选择目标池（走水去向池）');
+      return;
+    }
+    if (draft.pondId === draft.targetPondId) {
+      scheduleStore.setMessage('上游池与目标池不能是同一口池');
       return;
     }
     if (editingId() === null) {
@@ -233,10 +245,21 @@ export default function ScheduleBoard() {
                     ⠿
                   </span>
                   <div class="min-w-[180px] flex-1">
-                    <p class="text-sm font-medium text-slate-800">{pondLabel(row.pondId)}</p>
+                    <p class="text-sm font-medium text-slate-800">
+                      {pondLabel(row.pondId)}
+                      <Show when={row.targetPondId !== ''}>
+                        <span class="mx-1 text-brine-500">→</span>
+                        <span class="text-slate-600">{pondLabel(row.targetPondId)}</span>
+                      </Show>
+                    </p>
                     <p class="text-xs text-slate-500">
                       计划日期 {row.planDate} · 调度员 {row.operator === '' ? '未填写' : row.operator}
                     </p>
+                    <Show when={row.blockedReason !== ''}>
+                      <p class="mt-1 rounded border border-amber-200 bg-amber-50 px-2 py-0.5 text-[11px] leading-relaxed text-amber-700">
+                        已退回：{row.blockedReason}
+                      </p>
+                    </Show>
                   </div>
                   <div class="flex items-center gap-2">
                     <StageTag stage={pondOf(row.pondId)?.stage ?? null} size="sm" />
@@ -274,8 +297,7 @@ export default function ScheduleBoard() {
                       class="rounded-md border border-brine-300 bg-brine-50 px-2.5 py-1 text-xs text-brine-700 transition hover:bg-brine-100 disabled:opacity-50"
                       disabled={row.state === '已出卤'}
                       onClick={async () => {
-                        const next = await scheduleStore.advance(row.id);
-                        if (next === null) scheduleStore.setMessage('该计划已处于「已出卤」状态');
+                        await scheduleStore.advance(row.id);
                       }}
                     >
                       {nextStateLabel(row.state)}
@@ -320,12 +342,29 @@ export default function ScheduleBoard() {
       >
         <div class="grid gap-3 sm:grid-cols-2">
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
-            <span>蒸发池</span>
+            <span>上游池</span>
             <select class={INPUT} value={draft.pondId} onChange={(event) => setDraft('pondId', event.currentTarget.value)}>
               <option value="">请选择</option>
               <For each={pondStore.state.ponds}>
                 {(pond) => (
                   <option value={pond.id}>
+                    {pond.code} · {pond.seriesName} · {pond.stage}
+                  </option>
+                )}
+              </For>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>目标池（走水去向）</span>
+            <select
+              class={INPUT}
+              value={draft.targetPondId}
+              onChange={(event) => setDraft('targetPondId', event.currentTarget.value)}
+            >
+              <option value="">请选择</option>
+              <For each={pondStore.state.ponds}>
+                {(pond) => (
+                  <option value={pond.id} disabled={pond.id === draft.pondId}>
                     {pond.code} · {pond.seriesName} · {pond.stage}
                   </option>
                 )}

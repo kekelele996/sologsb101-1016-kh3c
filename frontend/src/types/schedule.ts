@@ -13,8 +13,10 @@ export const SCHEDULE_STATE_FLOW: ScheduleState[] = ['待排', '已排', '走水
 
 export interface Schedule {
   id: string
-  /** 所属蒸发池 */
+  /** 上游池（走水来源池） */
   pondId: string
+  /** 目标池（走水去向池）：调度室排计划时只盯池子，放行前要按闸门串级查上游池到目标池通不通 */
+  targetPondId: string
   /** 计划走水日期 YYYY-MM-DD */
   planDate: string
   /** 目标密度（g/cm³） */
@@ -27,6 +29,8 @@ export interface Schedule {
   state: ScheduleState
   /** 手工拖拽后的排序序号，越小越先走水 */
   orderIndex: number
+  /** 断开 / 排队原因：通路断开或下游池容量不够时写明，空表示正常 */
+  blockedReason: string
   createdAt: string
   updatedAt: string
   revision: number
@@ -35,6 +39,7 @@ export interface Schedule {
 /** 新建 / 编辑走水编排的表单草稿 */
 export interface ScheduleDraft {
   pondId: string
+  targetPondId: string
   planDate: string
   targetDensity: number
   volumeM3: number

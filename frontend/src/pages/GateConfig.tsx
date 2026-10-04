@@ -27,6 +27,7 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 const DEFAULT_DRAFT: GateDraft = {
   fromPondId: '',
   toPondId: '',
+  seriesName: '',
   openingPct: 50,
   widthCm: 120,
   state: '半开',
@@ -80,6 +81,7 @@ export default function GateConfig() {
       ...DEFAULT_DRAFT,
       fromPondId: ponds[0]?.id ?? '',
       toPondId: ponds[1]?.id ?? '',
+      seriesName: store.state.currentSeries ?? '',
     });
     setDialogOpen(true);
   };
@@ -89,6 +91,7 @@ export default function GateConfig() {
     setDraft({
       fromPondId: gate.fromPondId,
       toPondId: gate.toPondId,
+      seriesName: gate.seriesName,
       openingPct: gate.openingPct,
       widthCm: gate.widthCm,
       state: gate.state,
@@ -106,7 +109,14 @@ export default function GateConfig() {
       setMessage('上游池与下游池不能是同一口池');
       return;
     }
-    const payload: GateDraft = { ...draft, state: stateFromOpening(draft.openingPct) };
+    // 池系归属：新建时取当前池系；编辑时沿用上一次归属，缺失则按上下游池反推
+    const inferredSeries =
+      pondOf(draft.fromPondId)?.seriesName ?? pondOf(draft.toPondId)?.seriesName ?? '';
+    const payload: GateDraft = {
+      ...draft,
+      seriesName: draft.seriesName.trim() !== '' ? draft.seriesName : inferredSeries,
+      state: stateFromOpening(draft.openingPct),
+    };
     if (editingId() === null) {
       const stamp = nowIso();
       await putGate({
@@ -114,7 +124,7 @@ export default function GateConfig() {
         ...payload,
         createdAt: stamp,
         updatedAt: stamp,
-        revision: 2,
+        revision: 3,
       });
       setMessage(`已新建闸门：${pondLabel(payload.fromPondId)} → ${pondLabel(payload.toPondId)}`);
     } else {
@@ -227,6 +237,25 @@ export default function GateConfig() {
                           <span class="text-brine-600">→</span>
                           <span class="font-medium text-slate-800">{pondLabel(gate.toPondId)}</span>
                         </div>
+                        <div class="mt-1 flex flex-wrap items-center gap-1">
+                          <Show
+                            when={gate.seriesName.trim() !== ''}
+                            fallback={
+                              <span class="rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                                无池系归属
+                              </span>
+                            }
+                          >
+                            <span class="rounded border border-brine-200 bg-brine-50 px-1.5 py-0.5 text-[10px] text-brine-700">
+                              {gate.seriesName}
+                            </span>
+                          </Show>
+                          <Show when={gate.seriesName.trim() === ''}>
+                            <span class="rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">
+                              只读
+                            </span>
+                          </Show>
+                        </div>
                       </td>
                       <td class="px-3 py-2.5">
                         <StageTag stage={pondOf(gate.fromPondId)?.stage ?? null} size="sm" />
@@ -279,10 +308,20 @@ export default function GateConfig() {
                       <td class="px-3 py-2.5 text-xs text-slate-500">{gate.note === '' ? '—' : gate.note}</td>
                       <td class="px-3 py-2.5">
                         <div class="flex gap-2">
-                          <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(gate)}>
+                          <button
+                            class="text-xs text-brine-700 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+                            disabled={gate.seriesName.trim() === ''}
+                            title={gate.seriesName.trim() === '' ? '无池系归属的闸门只读，不可编辑' : '编辑闸门'}
+                            onClick={() => openEdit(gate)}
+                          >
                             编辑
                           </button>
-                          <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeletingGate(gate)}>
+                          <button
+                            class="text-xs text-rose-600 hover:underline disabled:cursor-not-allowed disabled:opacity-40"
+                            disabled={gate.seriesName.trim() === ''}
+                            title={gate.seriesName.trim() === '' ? '无池系归属的闸门只读，不可删除' : '删除闸门'}
+                            onClick={() => setDeletingGate(gate)}
+                          >
                             删除
                           </button>
                         </div>
@@ -350,6 +389,15 @@ export default function GateConfig() {
                 )}
               </For>
             </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>池系归属</span>
+            <input
+              class={INPUT}
+              value={draft.seriesName}
+              placeholder="按上下游池反推，留空则只读"
+              onInput={(event) => setDraft('seriesName', event.currentTarget.value)}
+            />
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>开度（%）</span>
