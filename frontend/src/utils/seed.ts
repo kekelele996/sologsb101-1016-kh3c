@@ -88,11 +88,12 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   // ---------------- 闸门串级（上游 → 下游，形成完整走向链） ----------------
+  // seriesName 为管护班口径的池系归属；跨池系备用闸按上游池归属北部一系
   const gates: Gate[] = [
-    wrap<Gate>({ id: 'gate-a-b', fromPondId: SEED_IDS.pondA, toPondId: SEED_IDS.pondB, openingPct: 65, widthCm: 120, state: '半开', note: '北部一系主走水通道' }),
-    wrap<Gate>({ id: 'gate-b-c', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondC, openingPct: 40, widthCm: 100, state: '半开', note: '进入锂盐阶段前的控流闸' }),
-    wrap<Gate>({ id: 'gate-d-e', fromPondId: SEED_IDS.pondD, toPondId: SEED_IDS.pondE, openingPct: 80, widthCm: 140, state: '半开', note: '南部二系主走水通道' }),
-    wrap<Gate>({ id: 'gate-b-e', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondE, openingPct: 0, widthCm: 90, state: '关闭', note: '跨池系调水备用闸，当前关闭' }),
+    wrap<Gate>({ id: 'gate-a-b', fromPondId: SEED_IDS.pondA, toPondId: SEED_IDS.pondB, openingPct: 65, widthCm: 120, state: '半开', seriesName: '北部一系', ownerInferred: false, note: '北部一系主走水通道' }),
+    wrap<Gate>({ id: 'gate-b-c', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondC, openingPct: 40, widthCm: 100, state: '半开', seriesName: '北部一系', ownerInferred: false, note: '进入锂盐阶段前的控流闸' }),
+    wrap<Gate>({ id: 'gate-d-e', fromPondId: SEED_IDS.pondD, toPondId: SEED_IDS.pondE, openingPct: 80, widthCm: 140, state: '半开', seriesName: '南部二系', ownerInferred: false, note: '南部二系主走水通道' }),
+    wrap<Gate>({ id: 'gate-b-e', fromPondId: SEED_IDS.pondB, toPondId: SEED_IDS.pondE, openingPct: 0, widthCm: 90, state: '关闭', seriesName: '北部一系', ownerInferred: false, note: '跨池系调水备用闸，当前关闭' }),
   ];
 
   // ---------------- 卤水日观测（每池 2–4 条，密度随日期递增） ----------------
@@ -128,13 +129,54 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 走水编排（覆盖放行 / 排队 / 断闸退回 / 已出卤保留） ----------------
+  // 已排 / 走水中的计划锁定了放行时的通路快照（routeGateIds / routePondIds），
+  // 管护班日后关闸或改派下游时据此识别作废的旧通路。
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    wrap<Schedule>({
+      id: 'schedule-a1', pondId: SEED_IDS.pondA, targetPondId: SEED_IDS.pondB,
+      planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1,
+      routeGateIds: ['gate-a-b'], routePondIds: [SEED_IDS.pondA, SEED_IDS.pondB],
+      blockedKind: '', blockedReason: '', shortfallM3: 0, releasedAt: '2026-09-28T01:00:00.000Z',
+    }),
+    wrap<Schedule>({
+      id: 'schedule-b1', pondId: SEED_IDS.pondB, targetPondId: SEED_IDS.pondC,
+      planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 2,
+      routeGateIds: ['gate-b-c'], routePondIds: [SEED_IDS.pondB, SEED_IDS.pondC],
+      blockedKind: '', blockedReason: '', shortfallM3: 0, releasedAt: '2026-10-03T01:00:00.000Z',
+    }),
+    wrap<Schedule>({
+      // 下游池北-03 已被走水中的 schedule-b1 占用，放行时容量不足，排队并写明差量
+      id: 'schedule-a2', pondId: SEED_IDS.pondA, targetPondId: SEED_IDS.pondC,
+      planDate: '2026-10-08', targetDensity: 1.20, volumeM3: 2500, operator: '韩江', state: '待排', orderIndex: 3,
+      routeGateIds: [], routePondIds: [],
+      blockedKind: 'capacity',
+      blockedReason: '下游池 北-03 容量不足：尚余容量 0 m³，本计划 2500 m³，差额 2500 m³，已排队待容量腾出后再放行',
+      shortfallM3: 2500, releasedAt: '',
+    }),
+    wrap<Schedule>({
+      // 跨池系备用闸 gate-b-e 被管护班关闭：通路走不通，退回待排并写明断在哪道闸
+      id: 'schedule-b2', pondId: SEED_IDS.pondB, targetPondId: SEED_IDS.pondE,
+      planDate: '2026-10-10', targetDensity: 1.18, volumeM3: 800, operator: '李文', state: '待排', orderIndex: 4,
+      routeGateIds: [], routePondIds: [],
+      blockedKind: 'path',
+      blockedReason: '通路已断：闸门「北-02 → 南-05」当前已关闭（开度 0%），北-02 到 南-05 走不通，退回待排重排',
+      shortfallM3: 0, releasedAt: '',
+    }),
+    wrap<Schedule>({
+      // 通路 d-e 畅通且南-05 尚余容量：调度员可直接放行验证成功路径
+      id: 'schedule-d1', pondId: SEED_IDS.pondD, targetPondId: SEED_IDS.pondE,
+      planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 120, operator: '王锐', state: '待排', orderIndex: 5,
+      routeGateIds: [], routePondIds: [],
+      blockedKind: '', blockedReason: '', shortfallM3: 0, releasedAt: '',
+    }),
+    wrap<Schedule>({
+      // 已出卤的历史记录：任何闸门变更都不影响，重检时保留不动
+      id: 'schedule-e1', pondId: SEED_IDS.pondE, targetPondId: SEED_IDS.pondD,
+      planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 6,
+      routeGateIds: [], routePondIds: [],
+      blockedKind: '', blockedReason: '', shortfallM3: 0, releasedAt: '2026-09-25T01:00:00.000Z',
+    }),
   ];
 
   await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {

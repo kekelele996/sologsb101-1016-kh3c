@@ -1,7 +1,11 @@
 /**
- * /gates 串级走向与闸门配置
+ * /gates 串级走向与闸门配置（盐田管护班台账）
  * 按池系渲染串级拓扑，开度就地编辑；开度调整后重算下游预计进水量。
  * 消费模型：Gate、Pond、Observation；复用组件：<FilterBar>、<StageTag>、<EmptyPanel>、<StatBadge>
+ *
+ * 边界：本页只管护闸门；关闸 / 改派下游 / 删闸后由调度室侧重检走水计划
+ * （db 层 emitGateChanged → coordination.revalidateActiveSchedules），
+ * 本页不直接改任何走水计划。小幅调开度不打回计划。
  */
 import { For, Show, createSignal, onMount } from 'solid-js';
 import { createStore } from 'solid-js/store';
@@ -14,6 +18,8 @@ import { usePondStore } from '../stores/pondStore';
 import { GATE_STATE_OPTIONS, type Gate, type GateDraft, type GateState } from '../types/gate';
 import { estimateInflowM3, gateFlowAreaM2, stateFromOpening } from '../utils/brine';
 import { putGate, removeGate, updateGateOpening } from '../utils/db';
+import { inferGateSeriesName } from '../utils/topology';
+import { revalidateActiveSchedules } from '../utils/coordination';
 import { nowIso, uuid } from '../utils/id';
 
 const INPUT =
@@ -30,8 +36,12 @@ const DEFAULT_DRAFT: GateDraft = {
   openingPct: 50,
   widthCm: 120,
   state: '半开',
+  seriesName: '',
   note: '',
 };
+
+/** 无主闸：升级时按上下游池反推不出归属（端池缺失），只读展示 */
+const isOrphanGate = (gate: Gate): boolean => gate.seriesName === '';
 
 export default function GateConfig() {
   const store = usePondStore();
@@ -66,7 +76,7 @@ export default function GateConfig() {
       const from = pondOf(gate.fromPondId);
       const to = pondOf(gate.toPondId);
       if (series === null) return true;
-      return from?.seriesName === series || to?.seriesName === series;
+      return gate.seriesName === series || from?.seriesName === series || to?.seriesName === series;
     });
   };
 
@@ -85,6 +95,7 @@ export default function GateConfig() {
   };
 
   const openEdit = (gate: Gate): void => {
+    if (isOrphanGate(gate)) return;
     setEditingId(gate.id);
     setDraft({
       fromPondId: gate.fromPondId,
@@ -92,6 +103,7 @@ export default function GateConfig() {
       openingPct: gate.openingPct,
       widthCm: gate.widthCm,
       state: gate.state,
+      seriesName: gate.seriesName,
       note: gate.note,
     });
     setDialogOpen(true);
@@ -106,38 +118,96 @@ export default function GateConfig() {
       setMessage('上游池与下游池不能是同一口池');
       return;
     }
-    const payload: GateDraft = { ...draft, state: stateFromOpening(draft.openingPct) };
-    if (editingId() === null) {
-      const stamp = nowIso();
-      await putGate({
-        id: uuid('gate'),
-        ...payload,
-        createdAt: stamp,
-        updatedAt: stamp,
-        revision: 2,
-      });
-      setMessage(`已新建闸门：${pondLabel(payload.fromPondId)} → ${pondLabel(payload.toPondId)}`);
-    } else {
-      const existing = store.state.gates.find((gate) => gate.id === editingId());
-      if (existing === undefined) return;
-      await putGate({ ...existing, ...payload });
-      setMessage('闸门配置已更新');
+    // 归属默认按上下游池反推：同系取该系，跨系取上游系
+    const inferred = inferGateSeriesName(
+      { fromPondId: draft.fromPondId, toPondId: draft.toPondId },
+      store.state.ponds,
+    );
+    if (inferred === '') {
+      setMessage('上游池或下游池不存在，无法确定池系归属（无主闸只读），不能保存');
+      return;
     }
-    setDialogOpen(false);
+    const payload: GateDraft = { ...draft, state: stateFromOpening(draft.openingPct), seriesName: draft.seriesName || inferred };
+    const wasStructuralChange =
+      editingId() !== null &&
+      (() => {
+        const prev = store.state.gates.find((gate) => gate.id === editingId());
+        return prev !== undefined && (prev.fromPondId !== payload.fromPondId || prev.toPondId !== payload.toPondId);
+      })();
+    try {
+      if (editingId() === null) {
+        const stamp = nowIso();
+        await putGate({
+          id: uuid('gate'),
+          ...payload,
+          ownerInferred: false,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: 3,
+        });
+        setMessage(`已新建闸门：${pondLabel(payload.fromPondId)} → ${pondLabel(payload.toPondId)}（归属 ${payload.seriesName}）`);
+      } else {
+        const existing = store.state.gates.find((gate) => gate.id === editingId());
+        if (existing === undefined) return;
+        await putGate({ ...existing, ...payload, ownerInferred: existing.ownerInferred });
+        // 改派下游池属于结构性变更：立即给出调度侧打回结果（db 层钩子也会兜底重检一次）
+        if (wasStructuralChange) {
+          const result = await revalidateActiveSchedules();
+          setMessage(
+            result.resetCount > 0
+              ? `下游池已改派：${result.resetCount} 条靠旧通路排的走水计划已退回调度室待排重排`
+              : '闸门走向已更新，当前没有受影响的走水计划',
+          );
+        } else {
+          setMessage('闸门配置已更新');
+        }
+      }
+      setDialogOpen(false);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : '闸门保存失败');
+    }
   };
 
   const confirmDelete = async (): Promise<void> => {
     const gate = deletingGate();
     if (gate === null) return;
-    await removeGate(gate.id);
-    setDeletingGate(null);
-    setMessage('闸门已删除');
+    try {
+      await removeGate(gate.id);
+      const result = await revalidateActiveSchedules();
+      setDeletingGate(null);
+      setMessage(
+        result.resetCount > 0
+          ? `闸门已拆除：${result.resetCount} 条靠该通路排的走水计划已退回调度室待排重排`
+          : '闸门已删除',
+      );
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : '闸门删除失败');
+    }
   };
 
   const adjustOpening = async (gate: Gate, openingPct: number): Promise<void> => {
+    if (isOrphanGate(gate)) {
+      setMessage('无主闸为只读闸门，不能调整开度');
+      return;
+    }
     const clamped = Math.max(0, Math.min(100, Math.round(openingPct)));
-    await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
-    setMessage(`已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%`);
+    if (clamped === gate.openingPct) return;
+    try {
+      await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
+      if (clamped <= 0) {
+        // 关闭通路：靠它排的计划退回待排；小幅调开度不会打回任何计划
+        const result = await revalidateActiveSchedules();
+        setMessage(
+          result.resetCount > 0
+            ? `已关闭 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)}：${result.resetCount} 条走水计划退回待排`
+            : `已关闭闸门「${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)}」，当前没有受影响的走水计划`,
+        );
+      } else {
+        setMessage(`已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%（小幅调开度不影响已排计划）`);
+      }
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : '开度调整失败');
+    }
   };
 
   return (
@@ -158,6 +228,12 @@ export default function GateConfig() {
           tone="warning"
         />
         <StatBadge
+          label="无主只读闸"
+          value={store.state.gates.filter((gate) => isOrphanGate(gate)).length}
+          suffix="条"
+          tone="warning"
+        />
+        <StatBadge
           label="下游预计进水合计"
           value={Math.round(totalInflow() * 10) / 10}
           suffix="m³/d"
@@ -174,7 +250,10 @@ export default function GateConfig() {
 
       <section class="rounded-xl border border-slate-200 bg-white p-4">
         <header class="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <h2 class="text-[15px] font-semibold text-slate-800">串级走向与闸门配置</h2>
+          <div>
+            <h2 class="text-[15px] font-semibold text-slate-800">串级走向与闸门配置</h2>
+            <p class="mt-0.5 text-xs text-slate-500">闸门串级归管护班维护；关闸 / 改派下游 / 拆闸后，调度室靠该通路排的计划自动退回待排，已出卤的保留。</p>
+          </div>
           <button type="button" class={BTN_PRIMARY} onClick={openCreate} disabled={store.state.ponds.length < 2}>
             + 新建闸门
           </button>
@@ -203,10 +282,11 @@ export default function GateConfig() {
 
         <Show when={store.state.gates.length > 0}>
           <div class="overflow-x-auto">
-            <table class="w-full min-w-[1100px] border-collapse text-sm">
+            <table class="w-full min-w-[1200px] border-collapse text-sm">
               <thead>
                 <tr class="border-b border-slate-200 bg-slate-50 text-left text-xs text-slate-500">
                   <th class="px-3 py-2">串级走向</th>
+                  <th class="px-3 py-2">池系归属</th>
                   <th class="px-3 py-2">上游阶段</th>
                   <th class="px-3 py-2">下游阶段</th>
                   <th class="px-3 py-2 w-64">开度（就地编辑）</th>
@@ -220,13 +300,26 @@ export default function GateConfig() {
               <tbody>
                 <For each={gatesOfSeries()}>
                   {(gate) => (
-                    <tr class="border-b border-slate-100 align-middle hover:bg-slate-50/60">
+                    <tr class={`border-b border-slate-100 align-middle hover:bg-slate-50/60 ${isOrphanGate(gate) ? 'bg-rose-50/40' : ''}`}>
                       <td class="px-3 py-2.5">
                         <div class="flex items-center gap-1.5 text-[13px]">
                           <span class="font-medium text-slate-800">{pondLabel(gate.fromPondId)}</span>
                           <span class="text-brine-600">→</span>
                           <span class="font-medium text-slate-800">{pondLabel(gate.toPondId)}</span>
                         </div>
+                      </td>
+                      <td class="px-3 py-2.5">
+                        <Show
+                          when={!isOrphanGate(gate)}
+                          fallback={<span class="rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[11px] text-rose-700" title="旧数据缺池系归属，按上下游池也反推不出，留只读">无主 · 只读</span>}
+                        >
+                          <span class="text-xs text-slate-600">
+                            {gate.seriesName}
+                            <Show when={gate.ownerInferred}>
+                              <span class="ml-1 text-[11px] text-slate-400" title="升级时按上下游池反推补上的归属">（反推）</span>
+                            </Show>
+                          </span>
+                        </Show>
                       </td>
                       <td class="px-3 py-2.5">
                         <StageTag stage={pondOf(gate.fromPondId)?.stage ?? null} size="sm" />
@@ -242,7 +335,8 @@ export default function GateConfig() {
                             max="100"
                             step="5"
                             value={gate.openingPct}
-                            class="h-1.5 flex-1 accent-brine-600"
+                            disabled={isOrphanGate(gate)}
+                            class="h-1.5 flex-1 accent-brine-600 disabled:opacity-40"
                             onChange={(event) => void adjustOpening(gate, Number(event.currentTarget.value))}
                           />
                           <input
@@ -250,7 +344,8 @@ export default function GateConfig() {
                             min="0"
                             max="100"
                             value={gate.openingPct}
-                            class="w-16 rounded border border-slate-300 px-1.5 py-1 text-xs tabular-nums outline-none focus:border-brine-500"
+                            disabled={isOrphanGate(gate)}
+                            class="w-16 rounded border border-slate-300 px-1.5 py-1 text-xs tabular-nums outline-none focus:border-brine-500 disabled:cursor-not-allowed disabled:opacity-40"
                             onChange={(event) => void adjustOpening(gate, Number(event.currentTarget.value))}
                           />
                           <span class="text-xs text-slate-400">%</span>
@@ -279,10 +374,20 @@ export default function GateConfig() {
                       <td class="px-3 py-2.5 text-xs text-slate-500">{gate.note === '' ? '—' : gate.note}</td>
                       <td class="px-3 py-2.5">
                         <div class="flex gap-2">
-                          <button class="text-xs text-brine-700 hover:underline" onClick={() => openEdit(gate)}>
+                          <button
+                            class="text-xs text-brine-700 hover:underline disabled:cursor-not-allowed disabled:text-slate-300 disabled:no-underline"
+                            disabled={isOrphanGate(gate)}
+                            title={isOrphanGate(gate) ? '无主闸只读，不能编辑' : ''}
+                            onClick={() => openEdit(gate)}
+                          >
                             编辑
                           </button>
-                          <button class="text-xs text-rose-600 hover:underline" onClick={() => setDeletingGate(gate)}>
+                          <button
+                            class="text-xs text-rose-600 hover:underline disabled:cursor-not-allowed disabled:text-slate-300 disabled:no-underline"
+                            disabled={isOrphanGate(gate)}
+                            title={isOrphanGate(gate) ? '无主闸只读，不能删除' : ''}
+                            onClick={() => setDeletingGate(gate)}
+                          >
                             删除
                           </button>
                         </div>
@@ -352,6 +457,15 @@ export default function GateConfig() {
             </select>
           </label>
           <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+            <span>池系归属</span>
+            <select class={INPUT} value={draft.seriesName} onChange={(event) => setDraft('seriesName', event.currentTarget.value)}>
+              <option value="">按上下游池自动反推</option>
+              <For each={store.seriesOptions()}>
+                {(series) => <option value={series}>{series}</option>}
+              </For>
+            </select>
+          </label>
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
             <span>开度（%）</span>
             <input
               type="number"
@@ -383,13 +497,14 @@ export default function GateConfig() {
               <For each={GATE_STATE_OPTIONS}>{(state) => <option value={state}>{state}</option>}</For>
             </select>
           </label>
-          <label class="flex flex-col gap-1 text-[13px] text-slate-600">
+          <label class="flex flex-col gap-1 text-[13px] text-slate-600 sm:col-span-2">
             <span>备注</span>
             <input class={INPUT} value={draft.note} onInput={(event) => setDraft('note', event.currentTarget.value)} />
           </label>
         </div>
         <p class="mt-3 rounded-md bg-slate-50 px-3 py-2 text-xs leading-relaxed text-slate-500">
-          按开度自动推导的闸门状态为「{stateFromOpening(draft.openingPct)}」；保存时以开度推导结果为准。
+          按开度自动推导的闸门状态为「{stateFromOpening(draft.openingPct)}」，保存时以开度推导结果为准；
+          关闭 / 改派下游 / 删除会让靠旧通路排的走水计划退回调度室待排，小幅调整开度不会打回计划。
         </p>
       </AppDialog>
 
@@ -411,7 +526,7 @@ export default function GateConfig() {
       >
         <p class="text-sm leading-relaxed text-slate-600">
           将删除串级「{pondLabel(deletingGate()?.fromPondId ?? '')} → {pondLabel(deletingGate()?.toPondId ?? '')}」，
-          删除后下游池将失去该进水通道。
+          删除后下游池将失去该进水通道，靠这条通路排的未完成走水计划会自动退回调度室待排重排（已出卤的保留）。
         </p>
       </AppDialog>
     </div>
